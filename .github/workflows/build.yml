@@ -2,7 +2,7 @@ name: undetected-frida
 
 on:
   schedule:
-  - cron: "0 9/12 * * *"
+    - cron: "0 9/12 * * *"
   workflow_dispatch:
 
 env:
@@ -44,7 +44,6 @@ jobs:
         unzip -qo android-ndk-r25c-linux.zip
         rm -f android-ndk-r25c-linux.zip
 
-        # Place it under a canonical r25 path and persist env vars for following steps
         mkdir -p "$HOME/ndk/25.2.9519653"
         rm -rf "$HOME/ndk/25.2.9519653"
         mv android-ndk-r25c "$HOME/ndk/25.2.9519653"
@@ -72,15 +71,60 @@ jobs:
           popd
         fi
 
-    - name: Build Frida
+    - name: Clone Frida (target version)
       env:
         FRIDA_VERSION: ${{ env.FRIDA_VERSION }}
       run: |
         set -e
-        # ANDROID_NDK_* are already in env from the previous step via $GITHUB_ENV
-        echo "Using ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT}"
+        git clone --recurse-submodules https://github.com/frida/frida -b "${FRIDA_VERSION}" frida
 
-        git clone --recurse-submodules https://github.com/frida/frida -b "${FRIDA_VERSION}"
+    - name: Clone frida-stealth (AsenOsen) for patches
+      run: |
+        set -e
+        # shallow clone of the stealth repo; adjust URL/branch if you want a specific tag/commit
+        git clone --depth 1 https://github.com/AsenOsen/frida-stealth.git frida-stealth
+
+    - name: Apply stealth patches (from AsenOsen/frida-stealth)
+      run: |
+        set -e
+        # Avoid Git autocrlf issues
+        git config --global core.autocrlf false
+        git config --global apply.whitespace fix
+
+        # Ensure patches exist in the cloned stealth repo
+        if [ ! -f frida-stealth/frida-core/patch.patch ]; then
+          echo "ERROR: frida-stealth/frida-core/patch.patch not found"; ls -la frida-stealth || true; exit 2
+        fi
+        if [ ! -f frida-stealth/frida-gum/patch.patch ]; then
+          echo "ERROR: frida-stealth/frida-gum/patch.patch not found"; ls -la frida-stealth || true; exit 2
+        fi
+
+        # Apply frida-core patch
+        pushd frida/frida-core
+        # apply with --reject --whitespace=fix to keep .rej files if hunks fail
+        git apply --reject --whitespace=fix ../../frida-stealth/frida-core/patch.patch || true
+        popd
+
+        # Apply frida-gum patch
+        pushd frida/frida-gum
+        git apply --reject --whitespace=fix ../../frida-stealth/frida-gum/patch.patch || true
+        popd
+
+        # Collect any .rej (rejected hunks) for debugging
+        mkdir -p patch-rejects
+        find frida -name "*.rej" -print -exec cp --parents {} patch-rejects/ \; || true
+        if [ -n "$(find patch-rejects -type f -name '*.rej' 2>/dev/null)" ]; then
+          echo "Some hunks were rejected; .rej files captured in patch-rejects/"
+        else
+          echo "All patches applied without .rej files (best case)"
+        fi
+
+    - name: Build Frida (with patches applied)
+      env:
+        FRIDA_VERSION: ${{ env.FRIDA_VERSION }}
+      run: |
+        set -e
+        echo "Using ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT}"
         pushd frida
 
         set +e
@@ -88,7 +132,7 @@ jobs:
         SESSION_SERVICE="$(tr -cd 'a-f0-9' </dev/urandom | head -c32)"
         set -e
 
-        # Apply local patches if directories exist (no-op otherwise)
+        # Optional: re-apply repo-local patches if you still want to support those folders
         for k in strongR-frida florida rycoh99; do
           [ -d "../${k}" ] || continue
           for i in "../${k}/"*; do
@@ -140,13 +184,14 @@ jobs:
         tar -caf ../../undetected-frida-${FRIDA_VERSION}-${{ matrix.os }}-${{ matrix.arch }}.tar.zst .
         popd
 
-    - name: Upload artifacts
+    - name: Upload artifacts (build + any patch rejects)
       uses: actions/upload-artifact@v4
       with:
         name: undetected-frida-${{ env.FRIDA_VERSION }}-${{ matrix.os }}-${{ matrix.arch }}
         path: |
           undetected-frida-${{ env.FRIDA_VERSION }}-${{ matrix.os }}-${{ matrix.arch }}.tar.zst
           artifacts/${{ matrix.arch }}/**
+          patch-rejects/**
         if-no-files-found: warn
         retention-days: 7
         compression-level: 9
