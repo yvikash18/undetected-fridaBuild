@@ -17,7 +17,8 @@ jobs:
         os: [android]
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
     - name: Node 18 setup
       uses: actions/setup-node@v4
@@ -35,12 +36,12 @@ jobs:
       with:
         python-version: '3.12'
 
-    # ---- NDK r25c, persist env so later steps see it ----
-    - name: NDK 25c setup
+    - name: NDK 25c setup (persist env to GITHUB_ENV)
       run: |
-        set -e
+        set -euo pipefail
+
         curl -sSLO https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
-        [ "$(sha1sum android-ndk-r25c-linux.zip | awk '{print $1}')" = "53af80a1cce9144025b81c78c8cd556bff42bd0e" ] || exit 1
+        [ "$(sha1sum android-ndk-r25c-linux.zip | awk '{print $1}')" = "53af80a1cce9144025b81c78c8cd556bff42bd0e" ] || (echo "NDK checksum mismatch" && exit 1)
         unzip -qo android-ndk-r25c-linux.zip
         rm -f android-ndk-r25c-linux.zip
 
@@ -56,83 +57,99 @@ jobs:
           echo "ANDROID_NDK_LATEST_HOME=$NDK_DIR"
         } >> "$GITHUB_ENV"
 
-    - name: Install dependencies
+    - name: Install build dependencies
       run: |
-        [ $(id -u) -eq 0 ] || SUDO=sudo
-        ${SUDO} apt-get update && DEBIAN_FRONTEND=noninteractive ${SUDO} apt-get install -y \
+        set -euo pipefail
+        [ "$(id -u)" -eq 0 ] || SUDO=sudo
+        ${SUDO} apt-get update
+        DEBIAN_FRONTEND=noninteractive ${SUDO} apt-get install -y \
           build-essential ninja-build gcc-multilib g++-multilib lib32stdc++-9-dev \
           flex bison libc6-dev libc6-dev-i386 xz-utils plzip zstd pigz gettext-base
-        ${SUDO} /opt/hostedtoolcache/Python/3.12.*/x64/bin/pip3 install -U setuptools lief
+        ${SUDO} /opt/hostedtoolcache/Python/3.12.*/x64/bin/pip3 install -U setuptools lief || true
 
         _CARCH="${{ matrix.arch }}"
         if [ "${_CARCH%64}" = "${_CARCH}" ]; then
-          pushd /opt/hostedtoolcache/Python/3.12.*/x64/include/python3.12
-          patch -Rp1 <${{ github.workspace }}/pyconfig.h-i686-x86_64.patch || true
-          popd
+          pushd /opt/hostedtoolcache/Python/3.12.*/x64/include/python3.12 || true
+          if [ -f "${{ github.workspace }}/pyconfig.h-i686-x86_64.patch" ]; then
+            patch -Rp1 <${{ github.workspace }}/pyconfig.h-i686-x86_64.patch || true
+          fi
+          popd || true
         fi
 
     - name: Clone Frida (target version)
       env:
         FRIDA_VERSION: ${{ env.FRIDA_VERSION }}
       run: |
-        set -e
-        git clone --recurse-submodules https://github.com/frida/frida -b "${FRIDA_VERSION}" frida
+        set -euo pipefail
+
+        if [ ! -d frida ]; then
+          git clone --recurse-submodules https://github.com/frida/frida -b "${FRIDA_VERSION}" frida
+        else
+          echo "frida directory already exists; updating submodules"
+          git -C frida fetch --tags --prune || true
+          git -C frida submodule update --init --recursive || true
+        fi
 
     - name: Clone frida-stealth (AsenOsen) for patches
       run: |
-        set -e
-        # shallow clone of the stealth repo; adjust URL/branch if you want a specific tag/commit
-        git clone --depth 1 https://github.com/AsenOsen/frida-stealth.git frida-stealth
+        set -euo pipefail
+        if [ ! -d frida-stealth ]; then
+          git clone --depth 1 https://github.com/AsenOsen/frida-stealth.git frida-stealth
+        else
+          echo "frida-stealth already present"
+        fi
 
-    - name: Apply stealth patches (from AsenOsen/frida-stealth)
+    - name: Apply stealth patches (frida-core & frida-gum)
+      env:
+        FRIDA_VERSION: ${{ env.FRIDA_VERSION }}
       run: |
-        set -e
-        # Avoid Git autocrlf issues
+        set -euo pipefail
+
+        # sanity checks
+        test -d frida || (echo "frida not found" && ls -la || true && exit 3)
+        test -d frida/frida-core || (echo "frida/frida-core missing" && ls -la frida || true && exit 4)
+        test -d frida/frida-gum  || (echo "frida/frida-gum missing"  && ls -la frida || true && exit 5)
+        test -f frida-stealth/frida-core/patch.patch || (echo "frida-stealth/frida-core/patch.patch not found" && ls -la frida-stealth || true && exit 6)
+        test -f frida-stealth/frida-gum/patch.patch  || (echo "frida-stealth/frida-gum/patch.patch not found" && ls -la frida-stealth || true && exit 7)
+
         git config --global core.autocrlf false
         git config --global apply.whitespace fix
 
-        # Ensure patches exist in the cloned stealth repo
-        if [ ! -f frida-stealth/frida-core/patch.patch ]; then
-          echo "ERROR: frida-stealth/frida-core/patch.patch not found"; ls -la frida-stealth || true; exit 2
-        fi
-        if [ ! -f frida-stealth/frida-gum/patch.patch ]; then
-          echo "ERROR: frida-stealth/frida-gum/patch.patch not found"; ls -la frida-stealth || true; exit 2
-        fi
-
-        # Apply frida-core patch
+        echo "Applying frida-core patch"
         pushd frida/frida-core
-        # apply with --reject --whitespace=fix to keep .rej files if hunks fail
+        # keep .rej files if hunks fail; continue build for inspection
         git apply --reject --whitespace=fix ../../frida-stealth/frida-core/patch.patch || true
         popd
 
-        # Apply frida-gum patch
+        echo "Applying frida-gum patch"
         pushd frida/frida-gum
         git apply --reject --whitespace=fix ../../frida-stealth/frida-gum/patch.patch || true
         popd
 
-        # Collect any .rej (rejected hunks) for debugging
+        # collect rejects for inspection
         mkdir -p patch-rejects
         find frida -name "*.rej" -print -exec cp --parents {} patch-rejects/ \; || true
+
         if [ -n "$(find patch-rejects -type f -name '*.rej' 2>/dev/null)" ]; then
           echo "Some hunks were rejected; .rej files captured in patch-rejects/"
         else
-          echo "All patches applied without .rej files (best case)"
+          echo "All patches applied cleanly (no .rej files found)"
         fi
 
     - name: Build Frida (with patches applied)
       env:
         FRIDA_VERSION: ${{ env.FRIDA_VERSION }}
       run: |
-        set -e
-        echo "Using ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT}"
+        set -euo pipefail
+        echo "ANDROID_NDK_ROOT=${ANDROID_NDK_ROOT}"
         pushd frida
 
-        set +e
+        # Prepare randomized identifiers
         FRIDA_PREFIX="$(tr -cd 'a-z0-9' </dev/urandom | head -c32)"
         SESSION_SERVICE="$(tr -cd 'a-f0-9' </dev/urandom | head -c32)"
-        set -e
+        export FRIDA_PREFIX SESSION_SERVICE
 
-        # Optional: re-apply repo-local patches if you still want to support those folders
+        # (Optional) apply any local per-subproject patches as you previously had
         for k in strongR-frida florida rycoh99; do
           [ -d "../${k}" ] || continue
           for i in "../${k}/"*; do
@@ -156,7 +173,7 @@ jobs:
 
     - name: Collect & compress build outputs
       run: |
-        set -e
+        set -euo pipefail
         mkdir -p artifacts/${{ matrix.arch }}
         pushd frida
 
@@ -164,11 +181,15 @@ jobs:
         if [ -f "build/subprojects/frida-core/server/frida-server" ]; then
           python subprojects/frida-core/src/anti-anti-frida.py build/subprojects/frida-core/server/frida-server || true
           cp build/subprojects/frida-core/server/frida-server ../artifacts/${{ matrix.arch }}/frida-server-${{ matrix.arch }}
+        else
+          echo "Server binary not found; check build logs"
         fi
 
         # gadget
         if [ -f "build/subprojects/frida-core/lib/gadget/frida-gadget.so" ]; then
           cp build/subprojects/frida-core/lib/gadget/frida-gadget.so ../artifacts/${{ matrix.arch }}/frida-gadget-${{ matrix.arch }}.so
+        else
+          echo "Gadget .so not found; check build logs"
         fi
 
         # devkits/examples (optional)
@@ -179,12 +200,12 @@ jobs:
         done
         popd
 
-        # single compressed bundle
+        # single compressed bundle of artifacts for this matrix cell
         pushd artifacts/${{ matrix.arch }}
         tar -caf ../../undetected-frida-${FRIDA_VERSION}-${{ matrix.os }}-${{ matrix.arch }}.tar.zst .
         popd
 
-    - name: Upload artifacts (build + any patch rejects)
+    - name: Upload artifacts (build + patch-rejects)
       uses: actions/upload-artifact@v4
       with:
         name: undetected-frida-${{ env.FRIDA_VERSION }}-${{ matrix.os }}-${{ matrix.arch }}
