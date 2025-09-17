@@ -6,136 +6,227 @@ on:
   workflow_dispatch:
     inputs:
       frida_version:
-        description: 'Frida version tag to build (e.g. v16.0.0). Use "latest" to build latest release.'
+        description: 'Frida version tag to build (e.g. 16.5.2 or v16.5.2). Default: 16.5.2'
         required: false
-        default: 'latest'
+        default: '16.5.2'
 
 env:
-  # If you want to restrict which versions can be built from dispatch input,
-  # set a comma-separated list here (no spaces). Leave empty to allow any tag.
-  ALLOWED_FRIDA_VERSIONS: ""  # e.g. "v16.0.0,v15.2.0,v15.1.6"
+  # leave empty or set comma-separated allowed tags if you want restriction
+  ALLOWED_FRIDA_VERSIONS: ""
 
 jobs:
   check:
     runs-on: ubuntu-22.04
     outputs:
       FRIDA_VERSION: ${{ steps.set.outputs.FRIDA_VERSION }}
+      FRIDA_TAG: ${{ steps.set.outputs.FRIDA_TAG }}
     steps:
-      - name: Resolve FRIDA_VERSION
+      - name: Resolve FRIDA_VERSION and FRIDA_TAG
         id: set
         run: |
           set -euo pipefail
-          INPUT_VERSION="${{ github.event.inputs.frida_version || 'latest' }}"
+          # dispatch input (can be "16.5.2" or "v16.5.2" or "latest")
+          INPUT_VERSION="${{ github.event.inputs.frida_version || '16.5.2' }}"
           ALLOWED="${ALLOWED_FRIDA_VERSIONS:-}"
 
           if [ -n "$INPUT_VERSION" ] && [ "$INPUT_VERSION" != "latest" ]; then
-            # If an allowed list exists, verify membership
-            if [ -n "$ALLOWED" ]; then
-              IFS=',' read -r -a arr <<< "$ALLOWED"
-              ok=0
-              for v in "${arr[@]}"; do
-                if [ "$v" = "$INPUT_VERSION" ]; then ok=1; break; fi
-              done
-              if [ "$ok" -ne 1 ]; then
-                echo "Dispatch input '$INPUT_VERSION' is not in ALLOWED_FRIDA_VERSIONS ('$ALLOWED')"
-                echo "FRIDA_VERSION="
-                exit 1
-              fi
-            fi
             FRIDA_VERSION="$INPUT_VERSION"
           else
-            # Fetch latest tag from frida/frida
-            frida_version="$(curl -fsSL "https://api.github.com/repos/frida/frida/releases/latest" | jq -r .tag_name)"
-            if [ -z "$frida_version" ] || [ "$frida_version" = "null" ]; then
-              echo "Failed to determine latest frida release"
+            # get latest tag (if user explicitly chose latest)
+            FRIDA_VERSION="$(curl -fsSL https://api.github.com/repos/frida/frida/releases/latest | jq -r .tag_name)"
+            if [ -z "$FRIDA_VERSION" ] || [ "$FRIDA_VERSION" = "null" ]; then
+              echo "Failed to determine latest frida release"; exit 1
+            fi
+          fi
+
+          # Normalize tag for git (strip leading 'v' if present)
+          FRIDA_TAG="${FRIDA_VERSION#v}"
+
+          # optional: validate against allowed list if provided
+          if [ -n "$ALLOWED" ]; then
+            IFS=',' read -r -a arr <<< "$ALLOWED"
+            ok=0
+            for v in "${arr[@]}"; do
+              if [ "$v" = "$FRIDA_VERSION" ] || [ "$v" = "$FRIDA_TAG" ]; then ok=1; break; fi
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "Dispatch input '${FRIDA_VERSION}' not in ALLOWED_FRIDA_VERSIONS ('${ALLOWED}')"
               exit 1
             fi
-            FRIDA_VERSION="$frida_version"
           fi
 
           echo "FRIDA_VERSION=${FRIDA_VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "Resolved FRIDA_VERSION=${FRIDA_VERSION}"
+          echo "FRIDA_TAG=${FRIDA_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved FRIDA_VERSION=${FRIDA_VERSION} (git tag: ${FRIDA_TAG})"
+
   build:
     runs-on: ubuntu-22.04
     needs: check
-    if: needs.check.outputs.FRIDA_VERSION != ''
+    if: needs.check.outputs.FRIDA_TAG != ''
     strategy:
       matrix:
         arch: [arm64, arm, x86_64, x86]
         os: [android]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
 
-      - name: Set up Node 18
+      - name: Setup Node 18
         uses: actions/setup-node@v4
         with:
           node-version: 18
 
-      - name: Set up JDK 8
+      - name: Setup JDK 8
         uses: actions/setup-java@v4
         with:
           java-version: "8"
           distribution: temurin
 
-      - name: Set up Python 3.12
+      - name: Setup Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: NDK 25c setup
+      - name: Install system packages & pip deps
         run: |
-          curl -sSLO https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
-          # (sha1 check intentionally left — you may change/remove if desired)
-          [ "$(sha1sum android-ndk-r25c-linux.zip | awk '{print $1}')" = "53af80a1cce9144025b81c78c8cd556bff42bd0e" ] || exit 1
-          unzip -qo android-ndk-r25c-linux.zip; rm android-ndk-r25c-linux.zip;
-          rm -rf "${ANDROID_NDK%/*}/25.2.9519653"; mv -v android-ndk-r25c "${ANDROID_NDK%/*}/25.2.9519653"; export ANDROID_NDK="${ANDROID_NDK%/*}/25.2.9519653"
-          export ANDROID_NDK_HOME="${ANDROID_NDK}" ANDROID_NDK_ROOT="${ANDROID_NDK}" ANDROID_NDK_LATEST_HOME="${ANDROID_NDK}"
-
-      - name: Install dependencies
-        run: |
+          set -euxo pipefail
           [ $(id -u) -eq 0 ] || SUDO=sudo
-          ${SUDO} apt-get update && DEBIAN_FRONTEND=noninteractive ${SUDO} apt-get install -y build-essential ninja-build gcc-multilib g++-multilib lib32stdc++-9-dev flex bison libc6-dev libc6-dev-i386 xz-utils plzip zstd pigz gettext-base
+          ${SUDO} apt-get update
+          DEBIAN_FRONTEND=noninteractive ${SUDO} apt-get install -y \
+            build-essential ninja-build gcc-multilib g++-multilib \
+            lib32stdc++-9-dev flex bison libc6-dev libc6-dev-i386 \
+            xz-utils plzip zstd pigz gettext-base git jq curl
           ${SUDO} /opt/hostedtoolcache/Python/3.12.*/x64/bin/pip3 install -U setuptools lief
 
-          _CARCH="${{ matrix.arch }}"; if [ "${_CARCH%64}" = "${_CARCH}" ]; then
-            pushd /opt/hostedtoolcache/Python/3.12.*/x64/include/python3.12; patch -Rp1 <${{ github.workspace }}/pyconfig.h-i686-x86_64.patch || true; popd
+      - name: NDK 25c setup
+        run: |
+          set -euxo pipefail
+          curl -sSLO https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+          [ "$(sha1sum android-ndk-r25c-linux.zip | awk '{print $1}')" = "53af80a1cce9144025b81c78c8cd556bff42bd0e" ] || exit 1
+          unzip -qo android-ndk-r25c-linux.zip
+          rm android-ndk-r25c-linux.zip
+          # place it under runner toolcache-like path to avoid issues with unset ANDROID_NDK
+          mkdir -p "${RUNNER_TEMP}/android-ndk"
+          mv android-ndk-r25c "${RUNNER_TEMP}/android-ndk/25.2.9519653"
+          echo "ANDROID_NDK=${RUNNER_TEMP}/android-ndk/25.2.9519653" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=${RUNNER_TEMP}/android-ndk/25.2.9519653" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=${RUNNER_TEMP}/android-ndk/25.2.9519653" >> $GITHUB_ENV
+          echo "ANDROID_NDK_LATEST_HOME=${RUNNER_TEMP}/android-ndk/25.2.9519653" >> $GITHUB_ENV
+
+      - name: Clone frida at tag and clone Frida-Patchs
+        env:
+          FRIDA_TAG: ${{ needs.check.outputs.FRIDA_TAG }}
+        run: |
+          set -euxo pipefail
+          # clone frida (use tag normalized without leading v)
+          git clone --recurse-submodules --shallow-submodules --branch "${FRIDA_TAG}" https://github.com/frida/frida.git frida || {
+            echo "Primary clone failed for tag '${FRIDA_TAG}'. Listing available tags (top 50):"
+            git ls-remote --tags https://github.com/frida/frida | sed 's#.*/##' | sed 's/\^{}//' | sort -Vr | head -n50
+            exit 1
+          }
+          # clone patches repo (shallow)
+          git clone --depth=1 https://github.com/JsHookApp/Frida-Patchs.git Frida-Patchs || true
+          ls -la
+
+      - name: Apply patches (frida-core, frida-gum) if present
+        run: |
+          set -euxo pipefail
+          PATCH_DIR="${GITHUB_WORKSPACE}/Frida-Patchs"
+          FRIDA_DIR="${GITHUB_WORKSPACE}/frida"
+
+          # Search common patch filenames inside the patch repo and apply if found
+          if [ -d "${PATCH_DIR}" ]; then
+            # try multiple common locations / filenames
+            CORE_PATCH_CANDIDATES=(
+              "${PATCH_DIR}/frida-core/patch.patch"
+              "${PATCH_DIR}/frida-core/patches/patch.patch"
+              "${PATCH_DIR}/frida-core/patches/frida-core.patch"
+            )
+            GUM_PATCH_CANDIDATES=(
+              "${PATCH_DIR}/frida-gum/patch.patch"
+              "${PATCH_DIR}/frida-gum/patches/patch.patch"
+              "${PATCH_DIR}/frida-gum/patches/frida-gum.patch"
+            )
+
+            for p in "${CORE_PATCH_CANDIDATES[@]}"; do
+              if [ -f "${p}" ]; then
+                echo "Applying frida-core patch from ${p}"
+                pushd "${FRIDA_DIR}/subprojects/frida-core"
+                git apply --reject --whitespace=fix "${p}" || true
+                popd
+                break
+              fi
+            done
+
+            for p in "${GUM_PATCH_CANDIDATES[@]}"; do
+              if [ -f "${p}" ]; then
+                echo "Applying frida-gum patch from ${p}"
+                pushd "${FRIDA_DIR}/subprojects/frida-gum"
+                git apply --reject --whitespace=fix "${p}" || true
+                popd
+                break
+              fi
+            done
+          else
+            echo "Patch repo not found at ${PATCH_DIR}; skipping patch application."
           fi
 
       - name: Build Frida
         env:
-          ANDROID_NDK: "${{ runner.temp }}/android-ndk"  # not relied on, kept for readability
           FRIDA_VERSION: ${{ needs.check.outputs.FRIDA_VERSION }}
         run: |
           set -euxo pipefail
-          # Clone specific tag
-          git clone --recurse-submodules https://github.com/frida/frida -b "${FRIDA_VERSION}"
           pushd frida
 
           # random prefixes used by original script; kept for compatibility
-          FRIDA_PREFIX="$(tr -cd 'a-z0-9' </dev/urandom | head -c32)" SESSION_SERVICE="$(tr -cd 'a-f0-9' </dev/urandom | head -c32)"
+          FRIDA_PREFIX="$(tr -cd 'a-z0-9' </dev/urandom | head -c32)" || true
+          SESSION_SERVICE="$(tr -cd 'a-f0-9' </dev/urandom | head -c32)" || true
           export FRIDA_PREFIX SESSION_SERVICE
 
-          # apply local patches if present (keeps original logic but won't fail if none)
-          set +e
-          for k in strongR-frida florida rycoh99; do
-            for i in "../${k}/"*; do
-              if [ -d "subprojects/${i##*/}" ]; then
-                pushd "subprojects/${i##*/}"
-                for j in "../../../${k}/${i##*/}/"*.patch; do
-                  if [ -f "${j}" ]; then
-                    envsubst <"${j}" | patch -Np1 || true
-                  fi
-                done
-                popd
-              fi
-            done
-          done
-          set -e
-
-          # configure & make
+          # configure and build
           ./configure --prefix="${PWD}/build" --host="${{ matrix.os }}-${{ matrix.arch }}" --enable-frida-tools --enable-gadget --enable-server --enable-portal -- -Dfrida-gum:devkits=gum,gumjs -Dfrida-core:devkits=core
           make -j"$(nproc)"
           popd
+
+      - name: Post-process built binaries (anti-anti-frida)
+        env:
+          FRIDA_VERSION: ${{ needs.check.outputs.FRIDA_VERSION }}
+        run: |
+          set -euxo pipefail
+          python3 -m pip install --user lief || true
+          PATH_USER="$(python3 -m site --user-base)/bin"
+          export PATH="$PATH_USER:$PATH"
+
+          ANTISCRIPT="${GITHUB_WORKSPACE}/frida/subprojects/frida-core/src/anti-anti-frida.py"
+          if [ ! -f "${ANTISCRIPT}" ]; then
+            echo "anti-anti-frida.py not found at ${ANTISCRIPT}; skipping symbol-hiding step."
+          else
+            echo "Running anti-anti-frida on built targets (if present)..."
+            # candidate targets (adjust paths if necessary)
+            SERVER_BIN="${GITHUB_WORKSPACE}/frida/build/subprojects/frida-core/server/frida-server"
+            GADGET_SO="${GITHUB_WORKSPACE}/frida/build/subprojects/frida-core/lib/gadget/frida-gadget.so"
+            AGENT_SO="${GITHUB_WORKSPACE}/frida/build/subprojects/frida-core/lib/agent/frida-agent.so"
+            # frida-android-*/bin path depends on host/arch naming; glob
+            INJECT_BINS=( $(ls -1 frida/build/*/bin/frida-inject 2>/dev/null || true) )
+            PORTAL_BINS=( $(ls -1 frida/build/*/bin/frida-portal 2>/dev/null || true) )
+
+            candidates=( "${SERVER_BIN}" "${GADGET_SO}" "${AGENT_SO}" )
+            for f in "${candidates[@]}"; do
+              if [ -f "${f}" ]; then
+                echo "Processing ${f}"
+                python3 "${ANTISCRIPT}" "${f}" || echo "anti-anti failed for ${f} (continuing)"
+              else
+                echo "Not found: ${f}"
+              fi
+            done
+
+            for f in "${INJECT_BINS[@]}" "${PORTAL_BINS[@]}"; do
+              if [ -f "${f}" ]; then
+                echo "Processing ${f}"
+                python3 "${ANTISCRIPT}" "${f}" || echo "anti-anti failed for ${f} (continuing)"
+              fi
+            done
+          fi
 
       - name: Package artifacts
         env:
@@ -143,16 +234,14 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p artifacts
-          # Gather expected outputs (adjust paths if your build outputs differ)
-          if [ -f "frida/build/subprojects/frida-core/server/frida-server" ]; then
-            cp frida/build/subprojects/frida-core/server/frida-server "artifacts/frida-server-${{ matrix.arch }}-${FRIDA_VERSION}"
-          fi
-          if [ -f "frida/build/subprojects/frida-core/lib/gadget/frida-gadget.so" ]; then
-            cp frida/build/subprojects/frida-core/lib/gadget/frida-gadget.so "artifacts/frida-gadget-${{ matrix.arch }}-${FRIDA_VERSION}.so"
-          fi
+          # copy known outputs if present
+          find frida -path "*/build/subprojects/frida-core/server/frida-server" -type f -exec cp {} artifacts/ \; || true
+          find frida -path "*/build/subprojects/frida-core/lib/gadget/frida-gadget.so" -type f -exec cp {} artifacts/ \; || true
+          find frida -path "*/build/subprojects/frida-core/lib/agent/frida-agent.so" -type f -exec cp {} artifacts/ \; || true
+          find frida -path "*/build/*/bin/*" -type f -exec cp {} artifacts/ \; || true
 
-          # include devkits / example devkits if present
-          find frida/build -maxdepth 2 -type f -name '*-devkit-*.tar' -exec cp {} artifacts/ \; || true
+          # include any .rej (patch rejects) for debugging
+          find frida -name "*.rej" -type f -exec cp --parents {} artifacts/ \; || true
 
           tar -C artifacts -cvf "frida-artifacts-${{ matrix.arch }}-${FRIDA_VERSION}.tar" .
 
@@ -171,18 +260,15 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: frida-artifacts
-          # downloads all artifacts uploaded by the matrixed build jobs
 
-      - name: Inspect and create combined archive
+      - name: Create combined archive
         env:
           FRIDA_VERSION: ${{ needs.check.outputs.FRIDA_VERSION }}
         run: |
           set -euxo pipefail
           mkdir -p combined
-          cp frida-artifacts/* combined/ || true
-          # create a combined zip/tar
+          cp -a frida-artifacts/* combined/ || true
           tar -C combined -czf "undetected-frida-all-${FRIDA_VERSION}.tar.gz" .
-          # List the packaged file
           ls -l "undetected-frida-all-${FRIDA_VERSION}.tar.gz"
 
       - name: Upload combined artifact
